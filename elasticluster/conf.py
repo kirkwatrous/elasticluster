@@ -70,6 +70,8 @@ from elasticluster.validate import (
 ## defaults and built-in config
 
 KEY_RENAMES = [
+    # pylint: disable=bad-whitespace,bad-continuation
+
     # section   from key          to key          verbose?  supported until...
     ('cluster', 'setup_provider', 'setup',        True,     '2.0'),
     ('cloud',   'tenant_name',    'project_name', True,     '2.0'),
@@ -87,7 +89,7 @@ KEY_RENAMES = [
 
 SCHEMA = {
     'cloud': {
-        'provider': Or('azure', 'ec2_boto', 'google', 'openstack'),
+        'provider': Or('azure', 'ec2_boto', 'google', 'openstack', 'libcloud'),
         # allow other keys w/out restrictions; each cloud provider has its own
         # set of keys, which are handled separately
         str: str,
@@ -187,6 +189,12 @@ CLOUD_PROVIDER_SCHEMAS = {
         Optional("region_name"): nonempty_str,
         Optional("nova_api_version"): nova_api_version,
     },
+
+    'libcloud': {
+        "provider": 'libcloud',
+        'driver_name': nonempty_str,
+        Optional(str): str,
+    }
 }
 
 
@@ -196,6 +204,7 @@ CLOUD_PROVIDERS = {
     'openstack': ('elasticluster.providers.openstack',      'OpenStackCloudProvider'),
     'google':    ('elasticluster.providers.gce',            'GoogleCloudProvider'),
     'azure':     ('elasticluster.providers.azure_provider', 'AzureCloudProvider'),
+    'libcloud': ('elasticluster.providers.libcloud_provider', 'LibCloudProvider'),
 }
 
 
@@ -277,7 +286,7 @@ def make_creator(configfiles, storage_path=None):
 
 
 def _expand_config_file_list(paths, ignore_nonexistent=True,
-                            expand_user_dir=True, expand_env_vars=False):
+                             expand_user_dir=True, expand_env_vars=False):
     """
     Return list of (existing) configuration files.
 
@@ -458,6 +467,7 @@ def _update_nested_item(D, path, items):
     return target
 
 
+# pylint: disable=dangerous-default-value
 def _perform_key_renames(tree, changes=KEY_RENAMES):
     """
     Change a configuration "tree" in-place, renaming legacy keys to new names.
@@ -484,6 +494,13 @@ def _perform_key_renames(tree, changes=KEY_RENAMES):
       will be supported (only relevant if 4th field "verbose" is ``True``).
     """
     for section, from_key, to_key, verbose, supported in changes:
+        if section not in tree:
+            # XXX: should this be a configuration error instead?
+            log.warning(
+                "No section `%s` found in configuration!"
+                " This will almost certainly end up causing an error later on.",
+                section)
+            continue
         for stanza, pairs in tree[section].iteritems():
             # ensure we work on a copy of the keys collection,
             # so we can mutate the tree down below
@@ -520,6 +537,10 @@ def _perform_key_renames(tree, changes=KEY_RENAMES):
 
 
 def _dereference_config_tree(tree, evict_on_error=True):
+    # FIXME: Should allow *three* distinct behaviors on error?
+    # - "evict on error": remove the offending section and continue
+    # - "raise exception": raise a ConfigurationError at the first error
+    # - "just report": log errors but try to return all that makes sense
     """
     Modify `tree` in-place replacing cross-references by section name with the
     actual section content.
@@ -530,11 +551,28 @@ def _dereference_config_tree(tree, evict_on_error=True):
     to_evict = []
     for cluster_name, cluster_conf in tree['cluster'].iteritems():
         for key in ['cloud', 'login', 'setup']:
-            refname = cluster_conf[key]
-            if refname in tree[key]:
+            try:
+                refname = cluster_conf[key]
+            except KeyError:
+                log.error(
+                    "Configuration section `cluster/%s`"
+                    " is missing a `%s=` section reference."
+                    " %s",
+                    cluster_name, key,
+                    ("Dropping cluster definition." if evict_on_error else ""))
+                if evict_on_error:
+                    to_evict.append(cluster_name)
+                    break
+                else:
+                    # cannot continue
+                    raise ConfigurationError(
+                        "Invalid cluster definition `cluster/{0}:"
+                        " missing `{1}=` configuration key"
+                        .format(cluster_name, key))
+            try:
                 # dereference
                 cluster_conf[key] = tree[key][refname]
-            else:
+            except KeyError:
                 log.error(
                     "Configuration section `cluster/%s`"
                     " references non-existing %s section `%s`."
@@ -596,6 +634,11 @@ def _gather_node_kind_info(kind_name, cluster_name, cluster_conf):
             'login',
             'network_ids',
             'security_group',
+            'node_name',
+            'boot_disk_size',
+            'boot_disk_type',
+            'scheduling',
+            'tags'
             #'user_key_name',    ## from `login/*`
             #'user_key_private', ## from `login/*`
             #'user_key_public',  ## from `login/*`
@@ -614,8 +657,8 @@ def _gather_node_kind_info(kind_name, cluster_name, cluster_conf):
     return kind_values
 
 
-def _compute_desired_and_minimum_number_of_nodes(
-        kind_name, cluster_name, cluster_conf):
+# pylint: disable=invalid-name
+def _compute_desired_and_minimum_number_of_nodes(kind_name, cluster_name, cluster_conf):
     """
     Compute desired and minimum number of nodes of the given kind.
     """
@@ -694,6 +737,25 @@ def _cross_validate_final_config(objtree, evict_on_error=True):
     # take a copy of cluster config as we might be modifying it
     for name, cluster in list(objtree['cluster'].items()):
         valid = True
+        # ensure all cluster node kinds are defined in the `setup/*` section
+        setup_sect = cluster['setup']
+        for groupname, properties in cluster['nodes'].items():
+            if (groupname + '_groups') not in setup_sect:
+                log.error("Cluster `%s` requires nodes of kind `%s`,"
+                          " but no such group is defined"
+                          " in the referenced setup section.",
+                          name, groupname)
+                valid = False
+                break
+
+        # ensure `ssh_to` has a valid value
+        if 'ssh_to' in cluster and cluster['ssh_to'] not in cluster['nodes']:
+            log.error("Cluster `%s` is configured to SSH into nodes of kind `%s`,"
+                      " but no such kind is defined.",
+                      name, cluster['ssh_to'])
+            valid = False
+
+        # EC2-specific checks
         if cluster['cloud']['provider'] == 'ec2_boto':
             cluster_uses_vpc = ('vpc' in cluster['cloud'])
             for groupname, properties in cluster['nodes'].items():
