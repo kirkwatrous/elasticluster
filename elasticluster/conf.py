@@ -53,7 +53,7 @@ from schema import Schema, SchemaError, Optional, Or, Regex, Use
 from elasticluster import log
 from elasticluster.exceptions import ConfigurationError
 from elasticluster.providers.ansible_provider import AnsibleSetupProvider
-from elasticluster.cluster import Cluster
+from elasticluster.cluster import Cluster, NodeNamingPolicy
 from elasticluster.repository import MultiDiskRepository
 from elasticluster.utils import environment
 from elasticluster.validate import (
@@ -177,16 +177,20 @@ CLOUD_PROVIDER_SCHEMAS = {
 
     'openstack': {
         "provider": 'openstack',
-        Optional("auth_url", default=os.getenv('OS_AUTH_URL', '')): url,
-        Optional("username", default=os.getenv('OS_USERNAME', '')): nonempty_str,
-        Optional("password", default=os.getenv('OS_PASSWORD', '')): nonempty_str,
-        Optional("project_name",
-                 # if OS_PROJECT_NAME is not defined,
-                 # try legacy variable OS_TENANT_NAME as a fallback
-                 default=os.getenv('OS_PROJECT_NAME',
-                                   os.getenv('OS_TENANT_NAME', ''))): nonempty_str,
+        Optional("auth_url"): url,
+        Optional("username"): nonempty_str,
+        Optional("password"): nonempty_str,
+        Optional("user_domain_name"): nonempty_str,
+        Optional("project_domain_name"): nonempty_str,
+        Optional("project_name"): nonempty_str,
         Optional("request_floating_ip"): boolean,
         Optional("region_name"): nonempty_str,
+        Optional("compute_api_version"): Or('1.1', '2'),
+        Optional("image_api_version"): Or('1', '2'),
+        Optional("network_api_version"): Or('2.0'),
+        Optional("volume_api_version"): Or('1', '2', '3'),
+        Optional("identity_api_version"): Or('3', '2'),  # no default, can auto-detect
+        ## DEPRECATED, use `compute_api_version` instead
         Optional("nova_api_version"): nova_api_version,
     },
 
@@ -749,11 +753,18 @@ def _cross_validate_final_config(objtree, evict_on_error=True):
                 break
 
         # ensure `ssh_to` has a valid value
-        if 'ssh_to' in cluster and cluster['ssh_to'] not in cluster['nodes']:
-            log.error("Cluster `%s` is configured to SSH into nodes of kind `%s`,"
-                      " but no such kind is defined.",
-                      name, cluster['ssh_to'])
-            valid = False
+        if 'ssh_to' in cluster:
+            ssh_to = cluster['ssh_to']
+            try:
+                # extract node kind if this is a node name (e.g., `master001` => `master`)
+                parts = NodeNamingPolicy.parse(ssh_to)
+                ssh_to = parts['kind']
+            except ValueError:
+                pass
+            if ssh_to not in cluster['nodes']:
+                log.error("Cluster `%s` is configured to SSH into nodes of kind `%s`,"
+                          " but no such kind is defined.", name, ssh_to)
+                valid = False
 
         # EC2-specific checks
         if cluster['cloud']['provider'] == 'ec2_boto':
@@ -882,7 +893,36 @@ class Creator(object):
         provider_conf = cloud_conf.copy()
         provider_conf.pop('provider')
 
-        return ctor(storage_path=self.storage_path, **provider_conf)
+        # use a single keyword args dictionary for instanciating
+        # provider, so we can detect missing arguments in case of error
+        provider_conf['storage_path'] = self.storage_path
+        try:
+            return ctor(**provider_conf)
+        except TypeError:
+            # check that required parameters are given, and try to
+            # give a sensible error message if not; if we do not
+            # do this, users only see a message like this::
+            #
+            #   ERROR Error: __init__() takes at least 5 arguments (4 given)
+            #
+            # which gives no clue about what to correct!
+            import inspect
+            args, varargs, keywords, defaults = inspect.getargspec(ctor.__init__)
+            if defaults is not None:
+                # `defaults` is a list of default values for the last N args
+                defaulted = dict((argname, value)
+                                 for argname, value in zip(reversed(args),
+                                                           reversed(defaults)))
+            else:
+                # no default values at all
+                defaulted = {}
+            for argname in args[1:]:  # skip `self`
+                if argname not in provider_conf and argname not in defaulted:
+                    raise ConfigurationError(
+                        "Missing required configuration parameter `{0}`"
+                        " in cloud section for cluster `{1}`"
+                        .format(argname, cluster_template))
+
 
 
     def create_cluster(self, template, name=None, cloud=None, setup=None):

@@ -40,8 +40,14 @@ from binascii import hexlify
 
 # Elasticluster imports
 from elasticluster import log
-from elasticluster.exceptions import TimeoutError, NodeNotFound, \
-    InstanceError, InstanceNotFoundError, ClusterError
+from elasticluster.exceptions import (
+    ClusterError,
+    ConfigurationError,
+    InstanceError,
+    InstanceNotFoundError,
+    NodeNotFound,
+    TimeoutError,
+)
 from elasticluster.repository import MemRepository
 from elasticluster.utils import Struct, parse_ip_address_and_port, sighandler, timeout
 
@@ -660,7 +666,9 @@ class Cluster(Struct):
         try:
             return nodes[nodename]
         except KeyError:
-            raise NodeNotFound("Node %s not found" % nodename)
+            raise NodeNotFound(
+                "Node `{0}` not found in cluster `{1}`"
+                .format(nodename, self.name))
 
     def stop(self, force=False, wait=False):
         """
@@ -728,38 +736,85 @@ class Cluster(Struct):
                     node.name, node.instance_id, err, err.__class__)
         return failed
 
-    def get_frontend_node(self):
-        """Returns the first node of the class specified in the
-        configuration file as `ssh_to`, or the first node of
-        the first class in alphabetic order.
+
+    def get_ssh_to_node(self, ssh_to=None):
+        """
+        Return target node for SSH/SFTP connections.
+
+        The target node is the first node of the class specified in
+        the configuration file as ``ssh_to`` (but argument ``ssh_to``
+        can override this choice).
+
+        If not ``ssh_to`` has been specified in this cluster's config,
+        then try node class names ``ssh``, ``login``, ``frontend``,
+        and ``master``: if any of these is non-empty, return the first
+        node.
+
+        If all else fails, return the first node of the first class
+        (in alphabetic order).
 
         :return: :py:class:`Node`
-        :raise: :py:class:`elasticluster.exceptions.NodeNotFound` if no
-                valid frontend node is found
+        :raise: :py:class:`elasticluster.exceptions.NodeNotFound`
+          if no valid frontend node is found
         """
-        if self.ssh_to:
-            if self.ssh_to in self.nodes:
-                cls = self.nodes[self.ssh_to]
-                if cls:
-                    return cls[0]
-                else:
-                    log.warning(
-                        "preferred `ssh_to` `%s` is empty: unable to "
-                        "get the choosen frontend node from that class.",
-                        self.ssh_to)
-            else:
-                raise NodeNotFound(
-                    "Invalid ssh_to `%s`. Please check your "
-                    "configuration file." % self.ssh_to)
+        if ssh_to is None:
+            ssh_to = self.ssh_to
 
-        # If we reach this point, the preferred class was empty. Pick
-        # one using the default logic.
-        for cls in sorted(self.nodes.keys()):
-            if self.nodes[cls]:
-                return self.nodes[cls][0]
-        # Uh-oh, no nodes in this cluster.
-        raise NodeNotFound("Unable to find a valid frontend: "
-                           "cluster has no nodes!")
+        # first try to interpret `ssh_to` as a node name
+        if ssh_to:
+            try:
+                return self.get_node_by_name(ssh_to)
+            except NodeNotFound:
+                pass
+
+        # next, ensure `ssh_to` is a class name
+        if ssh_to:
+            try:
+                parts = self._naming_policy.parse(ssh_to)
+                log.warning(
+                    "Node `%s` not found."
+                    " Trying to find other node in class `%s` ...",
+                    ssh_to, parts['kind'])
+                ssh_to = parts['kind']
+            except ValueError:
+                # it's already a class name
+                pass
+
+        # try getting first node of kind `ssh_to`
+        if ssh_to:
+            try:
+                nodes = self.nodes[ssh_to]
+            except KeyError:
+                raise ConfigurationError(
+                    "Invalid configuration item `ssh_to={ssh_to}` in cluster `{name}`:"
+                    " node class `{ssh_to}` does not exist in this cluster."
+                    .format(ssh_to=ssh_to, name=self.name))
+            try:
+                return nodes[0]
+            except IndexError:
+                log.warning(
+                    "Chosen `ssh_to` class `%s` is empty: unable to "
+                    "get the choosen frontend node from that class.",
+                    ssh_to)
+
+        # If we reach this point, `ssh_to` was not set or the
+        # preferred class was empty. Try "natural" `ssh_to` values.
+        for kind in ['ssh', 'login', 'frontend', 'master']:
+            try:
+                nodes = self.nodes[kind]
+                return nodes[0]
+            except (KeyError, IndexError):
+                pass
+
+        # ... if all else fails, return first node
+        for kind in sorted(self.nodes.keys()):
+            if self.nodes[kind]:
+                return self.nodes[kind][0]
+
+        # Uh-oh, no nodes in this cluster!
+        raise NodeNotFound("Unable to find a valid frontend:"
+                           " cluster has no nodes!")
+
 
     def setup(self, extra_args=tuple()):
         """
@@ -874,7 +929,7 @@ class NodeNamingPolicy(object):
     :meth:`use` and :meth:`free` can parse the name back.  This
     implementation assumes that a node's numerical index is formed by
     the last digits in the name; to implement a more general/complex
-    scheme, override methods :meth:`_format` and :meth:`_parse`.
+    scheme, override methods :meth:`format` and :meth:`parse`.
 
     This class may seem over-engineered for the simple requirement
     that unique names be generated, but I've actually had to answer
@@ -893,19 +948,19 @@ class NodeNamingPolicy(object):
         self._top = defaultdict(int)
 
     @staticmethod
-    def _format(pattern, **args):
+    def format(pattern, **args):
         """
         Form a node name by interpolating `args` into `pattern`.
 
         This is actually nothing more than a call to
         `pattern.format(...)` but is provided as a separate
         overrideable method as it is logically paired with
-        :meth:`_parse`.
+        :meth:`parse`.
         """
         return pattern.format(**args)
 
     @staticmethod
-    def _parse(name):
+    def parse(name):
         """
         Return dict of parts forming `name`.  Raise `ValueError` if string
         `name` cannot be correctly parsed.
@@ -914,7 +969,7 @@ class NodeNamingPolicy(object):
         `NodeNamingPolicy._NODE_NAME_RE` to parse the name back into
         constituent parts.
 
-        This is ideally the inverse of :meth:`_format` -- it should be
+        This is ideally the inverse of :meth:`format` -- it should be
         able to parse a node name string into the parameter values
         that were used to form it.
         """
@@ -956,14 +1011,14 @@ class NodeNamingPolicy(object):
         else:
             self._top[kind] += 1
             index = self._top[kind]
-        return self._format(self.pattern, kind=kind, index=index, **extra)
+        return self.format(self.pattern, kind=kind, index=index, **extra)
 
     def use(self, kind, name):
         """
         Mark a node name as used.
         """
         try:
-            params = self._parse(name)
+            params = self.parse(name)
             index = int(params['index'], 10)
             if index in self._free[kind]:
                 self._free[kind].remove(index)
@@ -983,14 +1038,14 @@ class NodeNamingPolicy(object):
         It could thus be recycled to name a new node.
         """
         try:
-            params = self._parse(name)
+            params = self.parse(name)
             index = int(params['index'], 10)
             self._free[kind].add(index)
             assert index <= self._top[kind]
             if index == self._top[kind]:
                 self._top[kind] -= 1
         except ValueError:
-            # ignore failures in self._parse()
+            # ignore failures in self.parse()
             pass
 
 
@@ -1062,7 +1117,7 @@ class Node(Struct):
         self.extra.update(extra)
 
     def __setstate__(self, state):
-        self.__dict__ = state
+        self.__dict__.update(state)
         if 'image_id' not in state and 'image' in state:
             state['image_id'] = state['image']
 
@@ -1075,7 +1130,8 @@ class Node(Struct):
         `update_ips`:meth: methods should be used to further gather details
         about the state of the node.
         """
-        log.info("Starting node %s ...", self.name)
+        log.info("Starting node `%s` from image `%s` with flavor %s ...",
+                 self.name, self.image_id, self.flavor)
         self.instance_id = self._cloud_provider.start_instance(
             self.user_key_name, self.user_key_public, self.user_key_private,
             self.security_group,
@@ -1207,7 +1263,7 @@ class Node(Struct):
         return ("name=`{name}`, id=`{id}`,"
                 " ips=[{ips}], connection_ip=`{preferred_ip}`"
                 .format(name=self.name, id=self.instance_id,
-                        ips=ips, preferred_id=self.preferred_ip))
+                        ips=ips, preferred_ip=self.preferred_ip))
 
     def pprint(self):
         """Pretty print information about the node.

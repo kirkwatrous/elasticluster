@@ -355,6 +355,27 @@ Valid configuration keys for *openstack*
     starts, the config option will be ignored and the value of the
     variable will be used instead.
 
+``identity_api_version``
+
+    Force use of the OpenStack Identity ("Keystone") API v2 or v3: use the
+    values '2' or '3' respectively. If this configuration item is not specified,
+    try to autodetect. If the environment variable `OS_IDENTITY_API_VERSION` is
+    set, this option is ignored and the value of the variable is used instead.
+
+``project_domain_name``
+
+    OpenStack project domain; only used with the Identity API v3.
+    If an environment variable `OS_PROJECT_DOMAIN_NAME` is set when
+    elasticluster starts, the config option will be ignored and the
+    value of the variable will be used instead.
+
+``user_domain_name``
+
+    OpenStack user domain; only used with the Identity API v3.
+    If an environment variable `OS_USER_DOMAIN_NAME` is set when elasticluster
+    starts, the config option will be ignored and the value of the variable will
+    be used instead.
+
 ``region_name``
 
     OpenStack region (optional)
@@ -730,9 +751,9 @@ Mandatory configuration keys
 ``image_id``
 
     image id in `ami` format. If you are using OpenStack, you need to
-    run `euca-describe-images` to get a valid `ami-*` id. With Google 
-    Compute Engine you can also use a URL of a private image. `gcloud 
-    compute images describe <your_image_name>` will show the selfLink 
+    run `euca-describe-images` to get a valid `ami-*` id. With Google
+    Compute Engine you can also use a URL of a private image. `gcloud
+    compute images describe <your_image_name>` will show the selfLink
     URL to use.
 
 ``flavor``
@@ -766,15 +787,20 @@ Mandatory configuration keys
 
 ``ssh_to``
 
-    `ssh` and `sftp` nodes will connect to only one node. This is the
-    first of the group specified in this configuration option, or the
-    first node of the first group in alphabetical order.  For
-    instance, if you don't set any value for `ssh_to` and you defined
-    two groups: `frontend_nodes` and `compute_nodes`, the ssh and sftp
-    command will connect to `compute001` which is the first
-    `compute_nodes` node. If you specify `frontend`, instead, it will
-    connect to `frontend001` (or the first node of the `frontend`
-    group).
+    Commands ``elasticluster ssh`` and ``elasticluster sftp`` need to
+    single out one node from the cluster, and connect to it via
+    SSH/SFTP.  This parameter can specify:
+
+    * either a node name (e.g., `master001`) which will be the target
+      of SSH/SFTP connections, or
+    * a node class name (e.g., `frontend`): the first node in that
+      class will be the target.
+
+    If ``ssh_to`` is not specified, ElastiCluster will try the class
+    names ``ssh``, ``login``, ``frontend``, and ``master`` (in this
+    order).  If the cluster has no node in all these classes, then the
+    first found node is used.
+
 
 Optional configuration keys
 ---------------------------
